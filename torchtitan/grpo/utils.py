@@ -360,3 +360,15 @@ def distributed_reward_norm(
     norm_rewards.masked_fill_(single_mask, 0.0)
 
     return norm_rewards.to(rewards.dtype)
+
+def masked_mean(tensor, mask, per_seq=False):
+    if per_seq:
+        return ((tensor * mask).sum(dim=-1) / mask.sum(dim=-1)).mean()
+    else:
+        return (tensor * mask).sum() / mask.sum()
+
+def masked_sum(tensor, mask, per_seq=False):
+    if per_seq:
+        return (tensor * mask).sum(dim=-1)
+    else:
+        return (tensor * mask).sum()
