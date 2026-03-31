@@ -41,7 +41,9 @@ from torchtitan.grpo.grpo_step import (
     GRPOPPLossContext,
     scale_rewards,
 )
+from torchtitan.grpo.health import NumericalHealthMonitor
 from torchtitan.grpo.sglang_handling import (
+    AsyncWeightUpdater,
     get_hostname_url,
     get_sglang_urls,
     new_group,
@@ -235,6 +237,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.metrics_rank = _get_metrics_rank(parallel_dims, job_config)
         self.data_handler = OnlineDataHandler(metrics_rank=self.metrics_rank)
+        self.health_monitor = NumericalHealthMonitor()
+        self.async_weight_updater = None
+        if job_config.grpo.async_weight_update:
+            self.async_weight_updater = AsyncWeightUpdater(self)
 
         # build model (using meta init)
         model_args = self.train_spec.model_args[job_config.model.flavor]
@@ -1459,8 +1465,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 all_rewards = torch.cat([torch.from_numpy(b[4]).to(self.device).float() for b in batches])
                 all_prompt_ids = torch.cat([torch.from_numpy(b[5]).to(self.device).long() for b in batches])
                 
-                # Compute global mean/std and normalize
-                norm_rewards = distributed_reward_norm(all_rewards, all_prompt_ids)
+                # Compute global mean/std and normalize. 
+                # We use the replication mesh (dp_replicate) if available to normalize across replicated samples.
+                dp_mesh = self.parallel_dims.get_mesh("dp_replicate") if self.parallel_dims.dp_replicate_enabled else self.parallel_dims.get_mesh("batch")
+                norm_rewards = distributed_reward_norm(all_rewards, all_prompt_ids, mesh=dp_mesh)
+                
+                # Numerical Health Check on rewards
+                self.health_monitor.check(self.step, 0.0, rewards=all_rewards)
                 
                 # Redistribute normalized rewards back into batch tuples
                 curr_offset = 0
@@ -1554,6 +1565,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 ep_enabled=parallel_dims.ep_enabled,
             )
             grad_norms.append(grad_norm.mean().item())
+            
+            # Health check on gradients
+            self.health_monitor.check(self.step, grad_norms[-1])
+            
             self.optimizers.step()
         self.checkpointer.maybe_wait_for_staging()
         self.lr_schedulers.step()
@@ -1726,6 +1741,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         torch.distributed.barrier()
 
     def send_weights(self):
+        if self.async_weight_updater:
+            self.async_weight_updater.trigger_sync(self.step)
+        else:
+            self._send_weights_internal()
+
+    def _send_weights_internal(self):
         rank = torch.distributed.get_rank()
         # Build named_params from all local model_parts
         named_params = {}
@@ -1934,6 +1955,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
+
+        if self.async_weight_updater:
+            self.async_weight_updater.shutdown()
 
         logger.info("Training completed")
 

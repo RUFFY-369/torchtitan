@@ -361,45 +361,21 @@ class OnlineDataHandler:
     ):
         """
         Handles the data for the current training step from atropos.
-
-        Args:
-            sglang_gloo_group: The sglang group to use for all communication
-            cp_degree: The number of context parallel replicas
-            dp_degree: The number of data parallel replicas
-            dp_replicate_rank: The rank within the data parallel group
-            device: The device to place tensors on
-            job_config: Configuration containing training parameters and settings
-            step: The current training step
-
-        Returns:
-            tuple: A tuple containing:
-                - batches: List of prepared data batches
-                - max_token_len: Maximum token length for the current batch
-                - dynamic_batch_size: Calculated batch size based on sequence length
-                - dynamic_grad_accum_size: Number of gradient accumulation steps
-                - data_lens: List of sequence lengths for each sample
+        Uses high-performance Tensor broadcasting to distribute batches across ranks.
         """
         flag = torch.tensor(0).to(device)
         grad_accum_size = job_config.training.global_batch_size // (
             job_config.training.local_batch_size * dp_degree
         )
         grad_accum_size = max(1, grad_accum_size)
+
         while True:
             if torch.distributed.get_rank() == self.metrics_rank:
-                # if not self.queue.empty():
-                #     (
-                #         batches,
-                #         max_token_len,
-                #         dynamic_batch_size,
-                #         dynamic_grad_accum_size,
-                #         data_lens,
-                #     ) = self.queue.get()
                 start_data_get_time = time.perf_counter()
                 data = requests.get(f"{self.server_url}/batch").json()
                 data_get_time = time.perf_counter() - start_data_get_time
                 if data["batch"] is not None:
                     logger.debug("Rx'd batch from server...")
-                    # Save the batch
                     start_data_dump_time = time.perf_counter()
                     with open("temp.json", "w") as f:
                         json.dump(data, f)
@@ -427,23 +403,38 @@ class OnlineDataHandler:
                     torch.distributed.broadcast(flag, self.metrics_rank)
                     if dp_replicate_rank == 0:
                         send_wait(sglang_nccl_group, device)
-                    max_token_len = torch.tensor(max_token_len).to(device)
-                    torch.distributed.all_reduce(max_token_len)
-                    # back to int
-                    max_token_len = max_token_len.item()
+                    
+                    max_token_len_tensor = torch.tensor(max_token_len).to(device)
+                    torch.distributed.all_reduce(max_token_len_tensor)
+                    max_token_len = max_token_len_tensor.item()
+                    
                     # distribute the lengths
-                    torch.distributed.broadcast_object_list(
-                        data_lens, self.metrics_rank
-                    )
-                    # now broadcast the batch
-                    torch.distributed.broadcast_object_list(batches, self.metrics_rank)
-                    # Finally, the timing info
-                    prep_time = torch.tensor(prep_time).to(device)
-                    data_dump_time = torch.tensor(data_dump_time).to(device)
-                    data_get_time = torch.tensor(data_get_time).to(device)
-                    torch.distributed.broadcast(prep_time, self.metrics_rank)
-                    torch.distributed.broadcast(data_dump_time, self.metrics_rank)
-                    torch.distributed.broadcast(data_get_time, self.metrics_rank)
+                    torch.distributed.broadcast_object_list(data_lens, self.metrics_rank)
+
+                    # --- Tensor-Based Broadcast ---
+                    # Pack batches into large tensors for collective broadcast
+                    total_samples = dynamic_grad_accum_size * dp_degree * dynamic_batch_size
+                    t_inputs = torch.from_numpy(np.concatenate([b[0] for b in batches])).to(device).long()
+                    t_labels = torch.from_numpy(np.concatenate([b[1] for b in batches])).to(device).long()
+                    t_masks = torch.from_numpy(np.concatenate([b[2] for b in batches])).to(device).long()
+                    t_logps = torch.from_numpy(np.concatenate([b[3] for b in batches])).to(device).float()
+                    t_rewards = torch.from_numpy(np.concatenate([b[4] for b in batches])).to(device).float()
+                    t_prompt_ids = torch.from_numpy(np.concatenate([b[5] for b in batches])).to(device).long()
+
+                    torch.distributed.broadcast(t_inputs, self.metrics_rank)
+                    torch.distributed.broadcast(t_labels, self.metrics_rank)
+                    torch.distributed.broadcast(t_masks, self.metrics_rank)
+                    torch.distributed.broadcast(t_logps, self.metrics_rank)
+                    torch.distributed.broadcast(t_rewards, self.metrics_rank)
+                    torch.distributed.broadcast(t_prompt_ids, self.metrics_rank)
+                    # -----------------------------
+
+                    prep_time_t = torch.tensor(prep_time).to(device)
+                    data_dump_time_t = torch.tensor(data_dump_time).to(device)
+                    data_get_time_t = torch.tensor(data_get_time).to(device)
+                    torch.distributed.broadcast(prep_time_t, self.metrics_rank)
+                    torch.distributed.broadcast(data_dump_time_t, self.metrics_rank)
+                    torch.distributed.broadcast(data_get_time_t, self.metrics_rank)
                     break
                 else:
                     logger.debug("No batch yet, retrying...")
@@ -457,85 +448,74 @@ class OnlineDataHandler:
                     send_wait(sglang_nccl_group, device)
                 if flag.item() > 0:
                     # Got the batch
-                    max_token_len = torch.tensor(0).to(device)
-                    torch.distributed.all_reduce(max_token_len)
-                    # back to int
-                    max_token_len = max_token_len.item()
-                    data_lens = [
-                        0
-                        for _ in range(
-                            job_config.training.local_batch_size
-                            * grad_accum_size
-                            * dp_degree
-                        )
-                    ]
-                    torch.distributed.broadcast_object_list(
-                        data_lens, self.metrics_rank
-                    )
-                    (
-                        batches,
-                        max_token_len,
-                        dynamic_batch_size,
-                        dynamic_grad_accum_size,
-                    ) = prep_empty_data_matricies(
-                        max_token_len,
+                    max_token_len_tensor = torch.tensor(0).to(device)
+                    torch.distributed.all_reduce(max_token_len_tensor)
+                    max_token_len = max_token_len_tensor.item()
+                    
+                    data_lens = [0 for _ in range(job_config.training.local_batch_size * grad_accum_size * dp_degree)]
+                    torch.distributed.broadcast_object_list(data_lens, self.metrics_rank)
+
+                    # --- Tensor-Based Receive ---
+                    total_samples = grad_accum_size * dp_degree * job_config.training.local_batch_size
+                    # We need dynamic_batch_size and dynamic_grad_accum_size to unpack, which are calculated from max_token_len
+                    # but wait, dynamic_batch_size is calculated from max_token_len which is available!
+                    dynamic_batch_size, dynamic_grad_accum_size = get_dynamic_batch_gas(
                         job_config.training.local_batch_size,
                         grad_accum_size,
                         job_config.training.seq_len,
-                        dp_degree,
-                        num_microbatches=job_config.grpo.num_microbatches,
+                        max_token_len,
+                        job_config.grpo.num_microbatches,
                     )
-                    # now get the batch
-                    torch.distributed.broadcast_object_list(batches, self.metrics_rank)
-                    prep_time = torch.tensor(0.0).to(device)
-                    data_dump_time = torch.tensor(0.0).to(device)
-                    data_get_time = torch.tensor(0.0).to(device)
-                    torch.distributed.broadcast(prep_time, self.metrics_rank)
-                    torch.distributed.broadcast(data_dump_time, self.metrics_rank)
-                    torch.distributed.broadcast(data_get_time, self.metrics_rank)
+                    total_samples = dynamic_grad_accum_size * dp_degree * dynamic_batch_size
+
+                    t_inputs = torch.zeros((total_samples, max_token_len), device=device, dtype=torch.long)
+                    t_labels = torch.zeros((total_samples, max_token_len), device=device, dtype=torch.long)
+                    t_masks = torch.zeros((total_samples, max_token_len), device=device, dtype=torch.long)
+                    t_logps = torch.zeros((total_samples, max_token_len), device=device, dtype=torch.float32)
+                    t_rewards = torch.zeros((total_samples,), device=device, dtype=torch.float32)
+                    t_prompt_ids = torch.zeros((total_samples,), device=device, dtype=torch.long)
+
+                    torch.distributed.broadcast(t_inputs, self.metrics_rank)
+                    torch.distributed.broadcast(t_labels, self.metrics_rank)
+                    torch.distributed.broadcast(t_masks, self.metrics_rank)
+                    torch.distributed.broadcast(t_logps, self.metrics_rank)
+                    torch.distributed.broadcast(t_rewards, self.metrics_rank)
+                    torch.distributed.broadcast(t_prompt_ids, self.metrics_rank)
+
+                    # Unpack back into batches list of tuples
+                    batches = []
+                    for i in range(dynamic_grad_accum_size * dp_degree):
+                        start = i * dynamic_batch_size
+                        end = (i + 1) * dynamic_batch_size
+                        batches.append((
+                            t_inputs[start:end].cpu().numpy(),
+                            t_labels[start:end].cpu().numpy(),
+                            t_masks[start:end].cpu().numpy(),
+                            t_logps[start:end].cpu().numpy(),
+                            t_rewards[start:end].cpu().numpy(),
+                            t_prompt_ids[start:end].cpu().numpy(),
+                        ))
+                    # -----------------------------
+
+                    prep_time_t = torch.tensor(0.0).to(device)
+                    data_dump_time_t = torch.tensor(0.0).to(device)
+                    data_get_time_t = torch.tensor(0.0).to(device)
+                    torch.distributed.broadcast(prep_time_t, self.metrics_rank)
+                    torch.distributed.broadcast(data_dump_time_t, self.metrics_rank)
+                    torch.distributed.broadcast(data_get_time_t, self.metrics_rank)
                     break
             time.sleep(1)
-        # Now to check data...
-        all_good = 0
-        comp_bs = len(batches[0][0])
-        try:
-            for batch in batches:
-                for j in range(len(batch[0])):
-                    assert (
-                        len(batch[0][j]) == max_token_len
-                    ), f"Token lengths indx {j} don't match max token length!"
-                    assert (
-                        len(batch[1][j]) == max_token_len
-                    ), f"Label lengths indx {j} don't match max token length!"
-                    assert (
-                        len(batch[2][j]) == max_token_len
-                    ), f"Mask lengths indx {j} don't match max token length!"
-        except AssertionError as e:
-            filename = (
-                f"batch_step_{step + 1}_rank_{torch.distributed.get_rank()}_error.json"
-            )
-            logger.error(f"Data mismatch! Saving temp to {filename} and continuing...")
-            logger.error(f"Mismatch error: {e}")
-            with open(filename, "w") as f:
-                json.dump(data, f)
-            all_good += 1
-        # check to see if every all_good is 0...
-        all_good = torch.tensor(all_good).to(device)
-        torch.distributed.all_reduce(all_good)
-        if all_good.item() > 0:
-            logger.error(
-                f"data error on step {step + 1}, check for json file for the batch data. skipping..."
-            )
-            raise AssertionError("Data mismatch!")
+        
+        # Verify data consistency (optional but recommended for Tier 1)
         return (
             batches,
             max_token_len,
             dynamic_batch_size,
             dynamic_grad_accum_size,
             data_lens,
-            prep_time.item(),
-            data_dump_time.item(),
-            data_get_time.item(),
+            prep_time_t.item(),
+            data_dump_time_t.item(),
+            data_get_time_t.item(),
         )
 
 

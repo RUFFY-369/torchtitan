@@ -11,7 +11,8 @@ import torch.cuda
 import torch.distributed.tensor
 
 import wandb
-from torch import nn
+from torch import nn, Tensor
+from torch.distributed import DeviceMesh
 from torch.autograd import Function
 
 from torch.distributed.tensor import DTensor
@@ -274,7 +275,10 @@ class VocabParallelEntropyLoss(nn.Module):
 
 
 def distributed_reward_norm(
-    rewards: torch.Tensor, prompt_indices: torch.Tensor, eps: float = 1e-8
+    rewards: torch.Tensor,
+    prompt_indices: torch.Tensor,
+    eps: float = 1e-8,
+    mesh: Optional[DeviceMesh] = None,
 ) -> torch.Tensor:
     """
     Compute distributed reward normalization for GRPO.
@@ -285,6 +289,7 @@ def distributed_reward_norm(
         rewards: [batch_size] tensor of raw rewards
         prompt_indices: [batch_size] tensor of group indices (integers)
         eps: Epsilon for numerical stability
+        mesh: Optional DeviceMesh (e.g. DP mesh) to restrict reduction to specific ranks.
 
     Returns:
         norm_rewards: [batch_size] normalized rewards
@@ -310,10 +315,12 @@ def distributed_reward_norm(
     prompt_indices = prompt_indices.long()
 
     # Find total number of unique prompts in the global batch
-    # We use a large enough buffer or handle dynamic sizing
-    # For efficiency in a single all_reduce, we need a consistent index range
     max_idx = prompt_indices.max()
-    torch.distributed.all_reduce(max_idx, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(
+        max_idx,
+        op=torch.distributed.ReduceOp.MAX,
+        group=mesh.get_group() if mesh else None,
+    )
     num_prompts = max_idx.item() + 1
 
     # Initialize local accumulation buffers
@@ -328,13 +335,15 @@ def distributed_reward_norm(
         0, prompt_indices, torch.ones_like(rewards_f32, device=device)
     )
 
-    # Aggregate across all ranks
-    torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
-    torch.distributed.all_reduce(local_sum_sq, op=torch.distributed.ReduceOp.SUM)
-    torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+    # Aggregate across ranks in the specified mesh
+    group = mesh.get_group() if mesh else None
+    torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM, group=group)
+    torch.distributed.all_reduce(
+        local_sum_sq, op=torch.distributed.ReduceOp.SUM, group=group
+    )
+    torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM, group=group)
 
     # Compute global mean and variance
-    # Avoid division by zero for single-completion groups
     safe_count = torch.clamp(local_count, min=1.0)
     global_mean = local_sum / safe_count
     # variance = E[x^2] - (E[x])^2
@@ -342,7 +351,6 @@ def distributed_reward_norm(
     global_std = torch.sqrt(torch.clamp(global_var, min=0.0))
 
     # Apply normalization
-    # For single-completion groups (std=0 after aggregation), result will be 0
     norm_rewards = (rewards_f32 - global_mean[prompt_indices]) / (
         global_std[prompt_indices] + eps
     )
