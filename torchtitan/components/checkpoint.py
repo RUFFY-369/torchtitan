@@ -42,10 +42,16 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     StateDictOptions,
 )
-from torch.distributed.checkpoint.state_dict_saver import (
-    AsyncCheckpointerType,
-    AsyncSaveResponse,
-)
+try:
+    from torch.distributed.checkpoint.state_dict_saver import (
+        AsyncCheckpointerType,
+        AsyncSaveResponse,
+    )
+except ImportError:
+    AsyncCheckpointerType = None
+    class AsyncSaveResponse:
+        staging_completion = None
+        upload_completion = None
 from torch.distributed.checkpoint.stateful import Stateful
 
 from torchtitan.components.dataloader import BaseDataLoader
@@ -370,7 +376,7 @@ class CheckpointManager:
         async_mode: AsyncMode,
         enable_garbage_collection: bool = False,
         to_hf: bool = False,
-    ) -> Future | AsyncSaveResponse | None:
+    ) -> Any:
         """Save the checkpoint with dcp.
         Args:
             state_dict (dict): The state dict to save.
@@ -383,7 +389,7 @@ class CheckpointManager:
             Future: The future object if the checkpoint is async, otherwise None.
         """
 
-        ret: Future | AsyncSaveResponse | None = None
+        ret = None
 
         storage_writer: HuggingFaceStorageWriter | None = None
         checkpoint_save_id: str | None = None

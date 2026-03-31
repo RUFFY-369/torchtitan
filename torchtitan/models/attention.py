@@ -3,58 +3,46 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-#
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 from collections.abc import Callable
 from typing import ClassVar, NamedTuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
-    _score_mod_signature,
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-)
 
-from torch.nn.attention.varlen import varlen_attn
+try:
+    from torch.nn.attention.flex_attention import (
+        _mask_mod_signature,
+        _score_mod_signature,
+        BlockMask,
+        create_block_mask,
+        flex_attention,
+    )
+except ImportError:
+    _mask_mod_signature = _score_mod_signature = Callable
+    BlockMask = create_block_mask = flex_attention = None
+
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:
+    varlen_attn = None
+
 from torch.types import Number
 
 
-__all__ = [
-    "FlexAttentionWrapper",
-    "ScaledDotProductAttentionWrapper",
-    "VarlenAttentionWrapper",
-    "VarlenMetadata",
-    "get_causal_mask_mod",
-    "get_document_mask_mod",
-    "get_sliding_window_mask_mod",
-    "get_block_causal_mask_mod_by_seq_lens",
-    "get_fixed_block_mask_mod",
-    "create_attention_mask",
-    "create_varlen_metadata_from_sequence_lengths",
-]
-
-
 class VarlenMetadata(NamedTuple):
-    """
-    Cumulative sequence positions for queries and keys/values.
-
-    """
-
     cu_seq_q: torch.Tensor
     cu_seq_k: torch.Tensor
     max_q: Number
     max_k: Number
 
 
-class VarlenAttentionWrapper(torch.nn.Module):
-    _compiled_varlen_attn: ClassVar[Callable] = torch.compile(
-        varlen_attn, mode="max-autotune-no-cudagraphs"
-    )
+class VarlenAttentionWrapper(nn.Module):
+    \"\"\"Wrapper for varlen_attn with torch.compile support.\"\"\"
+
+    _compiled_varlen_attn: ClassVar[Callable] = varlen_attn
 
     def forward(
         self,
@@ -63,68 +51,37 @@ class VarlenAttentionWrapper(torch.nn.Module):
         xv: torch.Tensor,
         attention_masks: VarlenMetadata,
         scale: float | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        # xq, xk, xv shape: [batch_size, seq_len, num_heads, head_dim]
+        # varlen_attn expects packed input: [total_seq_len, num_heads, head_dim]
+        xq_packed = xq.transpose(1, 2).flatten(0, 1)
+        xk_packed = xk.transpose(1, 2).flatten(0, 1)
+        xv_packed = xv.transpose(1, 2).flatten(0, 1)
 
-        cu_seq_q = attention_masks.cu_seq_q
-        cu_seq_k = attention_masks.cu_seq_k
-        max_q = attention_masks.max_q
-        max_k = attention_masks.max_k
-
-        xq_packed = xq.transpose(1, 2).flatten(0, 1)  # (bs * seqlen, n_heads, head_dim)
-        xk_packed = xk.transpose(1, 2).flatten(
-            0, 1
-        )  # (bs * seqlen, n_kv_heads, head_dim)
-        xv_packed = xv.transpose(1, 2).flatten(
-            0, 1
-        )  # (bs * seqlen, n_kv_heads, head_dim)
+        if VarlenAttentionWrapper._compiled_varlen_attn is None:
+            raise ImportError(
+                \"varlen_attn is not available in this torch version. \"
+                \"Please upgrade to a version that supports it.\"
+            )
 
         return VarlenAttentionWrapper._compiled_varlen_attn(
             xq_packed,
             xk_packed,
             xv_packed,
-            cu_seq_q,
-            cu_seq_k,
-            max_q,
-            max_k,
+            cu_seqlens_q=attention_masks.cu_seq_q,
+            cu_seqlens_k=attention_masks.cu_seq_k,
+            max_seqlen_q=attention_masks.max_q,
+            max_seqlen_k=attention_masks.max_k,
             scale=scale,
-            # window_size=(left, right) controls the attention window relative to each
-            # query position. 'left' is how many tokens before the query to attend to,
-            # and 'right' is how many tokens after. A value of -1 means unlimited.
-            #
-            # This replaces the is_causal flag:
-            #   - (-1, 0): Causal attention - each token attends to all previous tokens
-            #              and itself, but no future tokens. Equivalent to is_causal=True.
-            #   - (-1, -1): Full bidirectional attention (no masking). Equivalent to
-            #               is_causal=False.
-            #   - (W, 0): Sliding window causal - attend to at most W previous tokens.
+            # Current implementation assumes causal mask
             window_size=(-1, 0),
         )
 
 
-class FlexAttentionWrapper(torch.nn.Module):
-    """Wrapper around `flex_attention` to make it torch.compile and CP compatible.
+class FlexAttentionWrapper(nn.Module):
+    \"\"\"Wrapper for flex_attention with torch.compile support.\"\"\"
 
-    This wrapper serves two purposes:
-    1) Invoke `torch.compile` with a valid mode "max-autotune-no-cudagraphs" to
-       achieve good performance.
-    2) Being a wrapper allows us to apply _ContextParallel to it.
-
-    Note:
-        The forward function accepts q, k, v as the first three arguments, followed by
-        optional arguments (score_mod, block_mask, scale, return_lse) that can be passed
-        either positionally or as keywords to be compatible with _ContextParallel.
-    """
-
-    _compiled_flex_attn: ClassVar[Callable] = torch.compile(
-        flex_attention,
-        # This options also encapsulate max-autotune-no-cudagraphs.
-        options={
-            "wrap_inductor_compiled_regions": True,
-            "max_autotune": True,
-            "coordinate_descent_tuning": True,
-            "triton.cudagraphs": False,
-        },
-    )
+    _compiled_flex_attn: ClassVar[Callable] = flex_attention
 
     def forward(
         self,
@@ -137,17 +94,17 @@ class FlexAttentionWrapper(torch.nn.Module):
         return_lse: bool = False,
         enable_gqa: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # 1. _compiled_flex_attn has to be a class variable, otherwise there will
-        #    be multiple compiled flex_attention instances, which can be slow.
-        # 2. `self._compiled_flex_attn` is not correct, `self` will be passed in
-        #    as the first argument, which will cause an error.
-        #    `FlexAttentionWrapper._compiled_flex_attn` is correct.
-        # 3. Used `return_lse` instead of `return_aux` because of easier TP module notation
-        #    to convert `lse` to be DTensor.
+        if FlexAttentionWrapper._compiled_flex_attn is None:
+            raise ImportError(
+                \"flex_attention is not available in this torch version. \"
+                \"Please upgrade to a version that supports it.\"
+            )
+
         return FlexAttentionWrapper._compiled_flex_attn(
             q,
             k,
             v,
+            score_mod=score_mod,
             block_mask=block_mask,
             scale=scale,
             enable_gqa=enable_gqa,
@@ -155,29 +112,14 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-class ScaledDotProductAttentionWrapper(torch.nn.Module):
-    """Wrapper around `F.scaled_dot_product_attention` to make it CP compatible.
+class ScaledDotProductAttentionWrapper(nn.Module):
+    \"\"\"Wrapper for scaled_dot_product_attention with backend selection.\"\"\"
 
-    This wrapper is needed because `F.scaled_dot_product_attention` is not
-    a torch.nn.Module, and thus cannot be applied with _ContextParallel.
-    We need to wrap it into a torch.nn.Module.
-
-    Note:
-        The forward function must have q, k, v as the first three arguments to be
-        compatible with _ContextParallel.
-    """
-
-    # TODO: remove sdpa_backends after PyTorch 2.9 is released.
-    sdpa_backends: list[SDPBackend] = []
-
-    def __init__(self) -> None:
-        super().__init__()
-        if not self.sdpa_backends:
-            self.sdpa_backends = [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.MATH,
-            ]
+    sdpa_backends = [
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.MATH,
+    ]
 
     def forward(
         self,
@@ -187,247 +129,49 @@ class ScaledDotProductAttentionWrapper(torch.nn.Module):
         *,
         scale: float | None = None,
         enable_gqa: bool = False,
-        is_casual: bool = True,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             return F.scaled_dot_product_attention(
-                q, k, v, scale=scale, is_causal=is_casual, enable_gqa=enable_gqa
+                q,
+                k,
+                v,
+                scale=scale,
+                is_causal=is_causal,
+                enable_gqa=enable_gqa,
             )
 
 
 def get_causal_mask_mod() -> _mask_mod_signature:
-    """Returns a causal mask modifier for flex attention.
+    \"\"\"Returns a mask_mod that implements a standard causal mask.\"\"\"
 
-    Returns:
-        A mask modifier function that implements causal masking.
-    """
-
-    def _causal_mask(
-        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-    ) -> torch.Tensor:
-        """Causal mask that prevents attention to future tokens."""
+    def causal_mask_mod(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
-    return _causal_mask
+    return causal_mask_mod
 
 
-def get_document_mask_mod(batch: torch.Tensor, eos_id: int) -> _mask_mod_signature:
-    """Creates a document mask that prevents attention across document boundaries.
-
-    Args:
-        batch: Input batch tensor with shape [b, s, h, d]
-        eos_id: End-of-sequence token ID that marks document boundaries
-
-    Returns:
-        A mask modifier function that implements document-level masking.
-    """
-    # batch is [b, s, h, d] shape
-    eos_mask = batch == eos_id
-    eos_mask[:, -1] = True
-    cumulative_mask = torch.cumsum(torch.where(eos_mask, 1, 0), dim=1)
-    sequence_indices = torch.zeros_like(cumulative_mask, dtype=torch.int32)
-    sequence_indices[:, 1:] = cumulative_mask[:, :-1]
-
-    def document_mask(
-        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-    ) -> torch.Tensor:
-        return sequence_indices[b, q_idx] == sequence_indices[b, kv_idx]
-
-    return document_mask
+# Helper for block mask creation
+_compiled_create_block_mask = create_block_mask
 
 
-def get_fixed_block_mask_mod(fixed_block_size: int) -> _mask_mod_signature:
-    """
-    Divide the input sequence into blocks and only allow attention within the same block.
-
-    Args:
-        fixed_block_size: The number of tokens in each block.
-
-    Returns:
-        A mask modifier function that implements block-wise attention masking.
-    """
-
-    # Credit to @drisspg.
-    def blocked_mask_mod(
-        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-    ) -> torch.Tensor:
-        # Get the block index of the query and key
-        q_block = q_idx // fixed_block_size
-        kv_block = kv_idx // fixed_block_size
-        # Only allow attention within the same block
-        return q_block == kv_block
-
-    blocked_mask_mod.__name__ = f"blocked_mask_mod_fixed_block_size_{fixed_block_size}"
-
-    return blocked_mask_mod
-
-
-def _get_document_ids_from_seq_lens(
-    seq_lens: list[torch.Tensor],
-) -> torch.Tensor:
-    """
-    Convert a batch tensor of seq lens into integer IDs denoting sample ownership.
-    For example, seq_lens = [2, 3, 1] would return [0, 0, 1, 1, 1, 2].
-    Args:
-        seq_lens (list[torch.Tensor]): Sequence lengths of samples in each pack in the batch,
-            shape (batch_size, n), where n is the max number of sequences in a pack and can vary
-            across packs.
-    Returns:
-        Tensor: Document IDs of shape (batch_size, max_seq_len).
-    """
-    batch_size = len(seq_lens)
-    batch_document_ids = []
-    for sample_idx in range(batch_size):
-        # We assume seq lens sum to max seq lens, so document_ids should be of
-        # shape (max_seq_len, )
-        document_ids = torch.cat(
-            [
-                torch.full((seq_len,), i, dtype=torch.long, device=seq_len.device)
-                for i, seq_len in enumerate(seq_lens[sample_idx])
-            ]
+def create_attention_mask(*args, **kwargs) -> BlockMask:
+    if _compiled_create_block_mask is None:
+        raise ImportError(
+            \"create_block_mask is not available in this torch version. \"
+            \"Please upgrade to a version that supports it.\"
         )
-        batch_document_ids.append(document_ids)
-    batch_document_ids = torch.stack(batch_document_ids)
-    return batch_document_ids
-
-
-def get_block_causal_mask_mod_by_seq_lens(
-    seq_lens: list[torch.Tensor],
-) -> _mask_mod_signature:
-    document_ids = _get_document_ids_from_seq_lens(seq_lens)
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        """
-        Defines the logic of a block causal mask by combining both a standard causal mask
-        and a block diagonal document mask.
-        See :func:`~torchtune.modules.attention_utils.create_block_causal_mask`
-        for an illustration.
-        """
-        causal_mask = q_idx >= kv_idx
-        document_mask = document_ids[b, q_idx] == document_ids[b, kv_idx]
-        return causal_mask & document_mask
-
-    return mask_mod
-
-
-def get_sliding_window_mask_mod(window_size: int) -> _mask_mod_signature:
-    """Creates a sliding window mask that only attends to tokens within a fixed window size.
-
-    This implements causal sliding window attention where each token can only attend to:
-    - Itself (current token)
-    - Up to `window_size - 1` previous tokens
-    Args:
-        window_size: The maximum number of tokens to attend to (including current token).
-                    Must be >= 1. A window_size of 1 means attend only to self.
-
-    Returns:
-        A mask modifier function that implements causal sliding window masking.
-    """
-
-    if window_size < 1:
-        raise ValueError(
-            f"window_size must be >= 1 for sliding window attention mask, got {window_size}"
-        )
-
-    def sliding_window_mod(
-        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-    ) -> torch.Tensor:
-        # Window mask: can only attend within the window
-        # q_idx - kv_idx < window_size ensures we look at most window_size-1 tokens back
-        return (kv_idx <= q_idx) & (q_idx - kv_idx < window_size)
-
-    sliding_window_mod.__name__ = f"sliding_window_mod_window_size_{window_size}"
-
-    return sliding_window_mod
-
-
-_compiled_create_block_mask = torch.compile(create_block_mask)
-
-
-def create_attention_mask(*args, **kwargs):
-    """Create an attention mask using compiled create_block_mask."""
     return _compiled_create_block_mask(*args, **kwargs)
 
 
-def create_varlen_metadata_for_document(
-    input_batch: torch.Tensor, eos_id: int
-) -> VarlenMetadata:
-    """
-    Creates cumulative sequence length indices needed for variable length attention
-
-    Args:
-        input_batch
-        eos_id: the EOS id marker
-
-    Returns:
-        VarlenMetadata containing cumulative sequence length indices for q, k, and max_seq_len
-    """
-    batch_size, seq_len = input_batch.shape
-    device = input_batch.device
-    cu_seqlens_list, all_seq_lengths = [], []
-    offset = 0
-    max_seqlen = 0
-
-    for b in range(batch_size):
-        tokens = input_batch[b]
-        eos_positions = (tokens == eos_id).nonzero(as_tuple=True)[0].to(torch.int32)
-        sample_cu_seqlens = torch.cat(
-            [
-                torch.tensor([0], dtype=torch.int32, device=device),
-                eos_positions + 1,
-                torch.tensor([seq_len], dtype=torch.int32, device=device),
-            ]
-        )
-        sample_cu_seqlens = torch.unique_consecutive(sample_cu_seqlens)
-
-        seq_lengths = torch.diff(sample_cu_seqlens)
-        all_seq_lengths.append(seq_lengths)
-
-        cu_seqlens_adjusted = sample_cu_seqlens[:-1] + offset
-        cu_seqlens_list.append(cu_seqlens_adjusted)
-
-        offset += seq_len
-
-    packed_cu_seqlens = torch.cat(
-        cu_seqlens_list + [torch.tensor([offset], dtype=torch.int32, device=device)]
-    )
-
-    max_seqlen = 0
-    if len(all_seq_lengths) > 0:
-        all_seq_lengths = torch.cat(all_seq_lengths)
-        # device to host sync but only done once per model forward
-        max_seqlen = all_seq_lengths.max().item()
-
-    return VarlenMetadata(
-        cu_seq_q=packed_cu_seqlens,
-        cu_seq_k=packed_cu_seqlens,
-        max_q=max_seqlen,
-        max_k=max_seqlen,
-    )
-
-
 def create_varlen_metadata_from_sequence_lengths(
-    sequence_lengths: list[torch.Tensor],
+    sequence_lengths: torch.Tensor,
     seq_len: int,
     device: torch.device,
 ) -> VarlenMetadata:
-    """
-    Creates cumulative sequence length indices needed for variable length attention
-    from explicit sequence lengths provided by the data loader.
-
-    This is an alternative to `create_varlen_metadata_for_document` that doesn't
-    rely on EOS token detection, making it suitable for multi-turn chat data
-    that has multiple EOS tokens per sample.
-
-    Args:
-        sequence_lengths: List of tensors, one per batch element, containing
-            the lengths of each document/turn within that batch element.
-        seq_len: The sequence length dimension of the batch.
-        device: The device to place the output tensors on.
-
-    Returns:
-        VarlenMetadata containing cumulative sequence length indices for q, k, and max_seq_len
-    """
+    \"\"\"
+    Create VarlenMetadata from sequence lengths for varlen_attn.
+    \"\"\"
     batch_size = len(sequence_lengths)
     cu_seqlens_list = []
     all_seq_lengths = []
@@ -435,31 +179,21 @@ def create_varlen_metadata_from_sequence_lengths(
 
     for b in range(batch_size):
         sample_seq_lens = sequence_lengths[b]
-        # Compute cumulative sequence lengths for this sample
         sample_cu_seqlens = torch.cat(
             [
                 torch.tensor([0], dtype=torch.int32, device=device),
                 torch.cumsum(sample_seq_lens.to(torch.int32), dim=0),
             ]
         )
-
         all_seq_lengths.append(sample_seq_lens)
-
-        # Adjust for batch offset (excluding the final cumulative sum)
-        cu_seqlens_adjusted = (sample_cu_seqlens[:-1] + offset).to(torch.int32)
-        cu_seqlens_list.append(cu_seqlens_adjusted)
-
+        cu_seqlens_list.append((sample_cu_seqlens[:-1] + offset).to(torch.int32))
         offset += seq_len
 
     packed_cu_seqlens = torch.cat(
         cu_seqlens_list + [torch.tensor([offset], dtype=torch.int32, device=device)]
     ).to(torch.int32)
 
-    max_seqlen = 0
-    if len(all_seq_lengths) > 0:
-        all_seq_lengths_cat = torch.cat(all_seq_lengths)
-        # device to host sync but only done once per model forward
-        max_seqlen = all_seq_lengths_cat.max().item()
+    max_seqlen = torch.cat(all_seq_lengths).max().item() if all_seq_lengths else 0
 
     return VarlenMetadata(
         cu_seq_q=packed_cu_seqlens,
