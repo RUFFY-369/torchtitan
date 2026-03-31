@@ -271,3 +271,84 @@ class VocabParallelEntropyLoss(nn.Module):
         # Add small epsilon to avoid log(0)
         entropy = torch.sum(probs * logp, dim=-1)  # [B, S]
         return entropy
+
+
+def distributed_reward_norm(
+    rewards: torch.Tensor, prompt_indices: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Compute distributed reward normalization for GRPO.
+    Normalizes rewards across groups, where each group is defined by prompt_indices.
+    Supports cases where a prompt group is split across multiple ranks.
+
+    Args:
+        rewards: [batch_size] tensor of raw rewards
+        prompt_indices: [batch_size] tensor of group indices (integers)
+        eps: Epsilon for numerical stability
+
+    Returns:
+        norm_rewards: [batch_size] normalized rewards
+    """
+    if not torch.distributed.is_initialized():
+        # Fallback to local normalization if not distributed
+        unique_indices = torch.unique(prompt_indices)
+        norm_rewards = torch.zeros_like(rewards)
+        for idx in unique_indices:
+            mask = prompt_indices == idx
+            group_rewards = rewards[mask]
+            if len(group_rewards) > 1:
+                mean = group_rewards.mean()
+                std = group_rewards.std()
+                norm_rewards[mask] = (group_rewards - mean) / (std + eps)
+            else:
+                norm_rewards[mask] = 0.0
+        return norm_rewards
+
+    # Ensure tensors are on the same device and float32 for reduction
+    device = rewards.device
+    rewards_f32 = rewards.float()
+    prompt_indices = prompt_indices.long()
+
+    # Find total number of unique prompts in the global batch
+    # We use a large enough buffer or handle dynamic sizing
+    # For efficiency in a single all_reduce, we need a consistent index range
+    max_idx = prompt_indices.max()
+    torch.distributed.all_reduce(max_idx, op=torch.distributed.ReduceOp.MAX)
+    num_prompts = max_idx.item() + 1
+
+    # Initialize local accumulation buffers
+    local_sum = torch.zeros(num_prompts, device=device, dtype=torch.float32)
+    local_sum_sq = torch.zeros(num_prompts, device=device, dtype=torch.float32)
+    local_count = torch.zeros(num_prompts, device=device, dtype=torch.float32)
+
+    # Fill local buffers
+    local_sum.scatter_add_(0, prompt_indices, rewards_f32)
+    local_sum_sq.scatter_add_(0, prompt_indices, rewards_f32**2)
+    local_count.scatter_add_(
+        0, prompt_indices, torch.ones_like(rewards_f32, device=device)
+    )
+
+    # Aggregate across all ranks
+    torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(local_sum_sq, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+
+    # Compute global mean and variance
+    # Avoid division by zero for single-completion groups
+    safe_count = torch.clamp(local_count, min=1.0)
+    global_mean = local_sum / safe_count
+    # variance = E[x^2] - (E[x])^2
+    global_var = (local_sum_sq / safe_count) - (global_mean**2)
+    global_std = torch.sqrt(torch.clamp(global_var, min=0.0))
+
+    # Apply normalization
+    # For single-completion groups (std=0 after aggregation), result will be 0
+    norm_rewards = (rewards_f32 - global_mean[prompt_indices]) / (
+        global_std[prompt_indices] + eps
+    )
+
+    # If a group has only 1 sample across all ranks, set its reward to 0
+    single_mask = local_count[prompt_indices] <= 1.0
+    norm_rewards.masked_fill_(single_mask, 0.0)
+
+    return norm_rewards.to(rewards.dtype)

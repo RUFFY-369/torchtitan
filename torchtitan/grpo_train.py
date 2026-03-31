@@ -51,7 +51,7 @@ from torchtitan.grpo.sglang_handling import (
     setup_group,
     wait_for_sglang,
 )
-from torchtitan.grpo.utils import VocabParallelEntropyFunction
+from torchtitan.grpo.utils import VocabParallelEntropyFunction, distributed_reward_norm
 from torchtitan.protocols import ModelProtocol
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
@@ -1453,6 +1453,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 get_time,
                 dump_time,
             ) = self.grab_batch()
+            
+            # Perform distributed reward normalization across all ranks and prompt groups
+            if len(batches) > 0:
+                all_rewards = torch.cat([torch.from_numpy(b[4]).to(self.device).float() for b in batches])
+                all_prompt_ids = torch.cat([torch.from_numpy(b[5]).to(self.device).long() for b in batches])
+                
+                # Compute global mean/std and normalize
+                norm_rewards = distributed_reward_norm(all_rewards, all_prompt_ids)
+                
+                # Redistribute normalized rewards back into batch tuples
+                curr_offset = 0
+                for i in range(len(batches)):
+                    b_size = len(batches[i][4])
+                    # Tuples are immutable, so we reconstruct them
+                    batches[i] = (
+                        batches[i][0], # input_ids
+                        batches[i][1], # labels
+                        batches[i][2], # masks
+                        batches[i][3], # inf_logps
+                        norm_rewards[curr_offset : curr_offset + b_size].cpu().numpy(),
+                        batches[i][5], # prompt_ids
+                    )
+                    curr_offset += b_size
+
             logger.debug("creating microbatches...")
             microbatches, actual_grad_accum, batch_prep_time = self.create_microbatches(
                 job_config=self.job_config,

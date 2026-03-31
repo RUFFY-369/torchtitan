@@ -58,7 +58,8 @@ def pad_data_to_good_offset(
     masks = list()
     lengths = list()
     inf_logps = list()
-    for item in data["batch"]:
+    prompt_ids = list()
+    for prompt_idx, item in enumerate(data["batch"]):
         scores = item["scores"]
         scores = np.array(scores)
         if scale_adv_by_len:
@@ -69,10 +70,8 @@ def pad_data_to_good_offset(
                 )
             unmasked_lengths = np.array(unmasked_lengths)
             scores = scores * unmasked_lengths
-        # check if we have more than 1 score...
-        if len(scores) > 1:
-            scores = scores - scores.mean()
-            scores = scores / max(scores.std(), 1e-8)
+        # No longer normalizing here on CPU. 
+        # Distributed normalization will happen on GPU in the training loop.
         item["scores"] = scores
         if item["overrides"] is not None:
             for i in range(len(item["overrides"])):
@@ -116,6 +115,7 @@ def pad_data_to_good_offset(
             labels.append(label_item[1:])
             rewards.append(item["scores"][i])
             masks.append(item["masks"][i][1:])
+            prompt_ids.append(prompt_idx) # Track correct prompt ID
             if item["inference_logprobs"] is None:
                 inf_logps.append(np.full(item["masks"][i].shape, 1.0, dtype=np.float32))
             else:
@@ -140,9 +140,10 @@ def pad_data_to_good_offset(
             "reward": reward,
             "length": length,
             "inf_logp": inf_logp,
+            "prompt_id": prompt_id,
         }
-        for (input_id, label, mask, reward, length, inf_logp) in zip(
-            input_ids, labels, masks, rewards, lengths, inf_logps
+        for (input_id, label, mask, reward, length, inf_logp, prompt_id) in zip(
+            input_ids, labels, masks, rewards, lengths, inf_logps, prompt_ids
         )
     ]
     sorted_items = sorted(raw_items, key=lambda x: x["length"], reverse=True)
@@ -166,6 +167,7 @@ def pad_data_to_good_offset(
         [x["mask"] for x in items],
         [x["length"] for x in items],
         [x["inf_logp"] for x in items],
+        [x["prompt_id"] for x in items],
     )
 
 
@@ -191,6 +193,7 @@ def prep_data(
         masks,
         lengths,
         inf_logps,
+        prompt_ids,
     ) = pad_data_to_good_offset(
         data,
         cp_degree,
@@ -217,6 +220,7 @@ def prep_data(
                 np.array(masks[start:end]),
                 np.array(inf_logps[start:end]),
                 np.array(rewards[start:end]),
+                np.array(prompt_ids[start:end]),
             )
         )
     return batches, max_token_len, dynamic_batch_size, dynamic_grad_accum_size, lengths
