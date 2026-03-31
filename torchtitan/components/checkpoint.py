@@ -43,10 +43,16 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 try:
+try:
     from torch.distributed.checkpoint.state_dict_saver import (
         AsyncCheckpointerType,
         AsyncSaveResponse,
     )
+except ImportError:
+    AsyncCheckpointerType = None
+    class AsyncSaveResponse:
+        staging_completion = None
+        upload_completion = None
 except ImportError:
     AsyncCheckpointerType = None
     class AsyncSaveResponse:
